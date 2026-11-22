@@ -27,11 +27,14 @@ This proposal adds support for clusters that run Cilium with kube-proxy replacem
 eBPF host routing. Today such a cluster is treated as a `generic` network plugin and cross-cluster pod
 traffic fails.
 
-The proposal is smaller than the two approaches discussed on #4106. It adds an operator discoverer for
-Cilium and a route-agent handler that keeps remote cluster CIDRs in Cilium's ip-masq-agent list. It also
-gives `subctl` a short list of Cilium settings to check, and documents a limitation for exported ClusterIP
-services on Cilium clusters. That limitation needs a change outside the CNI integration, which I will
-propose separately for Globalnet clusters.
+The proposal is smaller than the two approaches discussed on #4106, and it is delivered in three phases
+agreed in review. Phase 1 adds a route-agent handler that keeps remote cluster CIDRs in Cilium's
+ip-masq-agent list. The handler is loaded only when a field in the `submariner-global` ConfigMap is set, and
+no existing handler changes. Phase 2 adds a Cilium deployment to Shipyard and a CI job. Phase 3 adds an
+operator discoverer for Cilium, which replaces the manual field, and gives `subctl` a short list of Cilium
+settings to check. The proposal also documents a limitation for exported ClusterIP services on Cilium
+clusters. That limitation needs a change outside the CNI integration, which I will propose separately for
+Globalnet clusters.
 
 ## Motivation
 
@@ -89,8 +92,8 @@ of an `externalIPs` Service, leaving the translation to kube-proxy on the receiv
 
 ### Scope
 
-IPv4 is the verified path. The handler treats IPv6 CIDRs the same way, but IPv6 BPF masquerading is beta in
-Cilium and IPv6 is not part of Done When.
+IPv4 only. The Phase 1 handler writes IPv4 CIDRs and requires `enable-ipv4-masquerade`. IPv6 BPF
+masquerading is beta in Cilium, and IPv6 is left for later.
 
 Access to an exported ClusterIP service whose backends run on a Cilium cluster is a documented limitation,
 with and without Globalnet. With kube-proxy replacement, a request that arrives through the cable is not
@@ -102,11 +105,64 @@ removes the limitation by translating ClusterIP exports in Submariner's own rule
 (see Follow-ups). Clusters without Globalnet keep the headless workaround.
 
 Cilium clusters that keep kube-proxy and masquerade with iptables, with BPF masquerading off, are also outside
-this proposal. They keep today's generic path, and the handler stays idle there, because Cilium's
+this proposal. They keep today's generic path, and the handler, if enabled, stays idle there, because Cilium's
 ip-masq-agent exists only in the BPF implementation. `subctl diagnose` reports that masquerading is handled
 by iptables and points to the existing options: an `ipv4-native-routing-cidr` wide enough to cover the remote
 ranges, `egress-masquerade-interfaces` limited to the uplink, which helps with the WireGuard and VXLAN cables
 but not with libreswan, where traffic to the cable leaves through the uplink, or masquerading turned off.
+
+### Supported configurations
+
+The target is Cilium 1.16 to 1.20 on IPv4 with kube-proxy replacement, BPF masquerading, ip-masq-agent with
+an explicit list, and legacy host routing on the gateway nodes (see Prerequisites). The table shows what was
+run on kind with Cilium 1.20.2 and Submariner 0.25.0. "Handler" means the Phase 1 handler added the remote
+CIDRs to the list. "By hand" means they were in the list from install time and no handler ran.
+
+| Routing mode | IPAM | Remote CIDRs added | Result |
+|---|---|---|---|
+| tunnel | Kubernetes host-scope | handler | pass |
+| tunnel | cluster-pool | by hand | pass |
+| native | Kubernetes host-scope | by hand | pass |
+| native | cluster-pool | handler | pass |
+
+The check is pod to pod traffic over eight paths: client and server pods on gateway and non-gateway nodes, in
+both directions. In every row, two of the eight pass with the list alone, the ones between non-gateway nodes,
+and all eight pass once the gateway nodes use legacy host routing. The server sees the client pod IP.
+
+These runs used libreswan without Globalnet. WireGuard and Globalnet were run earlier in tunnel mode with
+Kubernetes IPAM, with the prerequisites set by hand (see Lab results). Not run: the VXLAN cable, and WireGuard
+or Globalnet with native routing or cluster-pool IPAM. Out of scope: IPv6, ClusterIP exports into a Cilium
+cluster, CNI chaining, the managed Cilium distributions and OpenShift with Cilium.
+
+### Supported connectivity
+
+What a Cilium cluster in the target configuration gets from Submariner. "Yes" was run on kind and passed.
+"No" is the documented limitation. "Not run" is expected to work but has no run behind it.
+
+| Capability | Without Globalnet | With Globalnet |
+|---|---|---|
+| Pod to remote pod IP | yes | not applicable |
+| Pod to headless export | yes | yes |
+| Pod to ClusterIP export, backends on Cilium | no | no |
+| Pod to ClusterIP export, backends on another CNI | yes | not run |
+| `clusterset.local` DNS names | yes | yes |
+| Cluster and namespace `GlobalEgressIP` | not applicable | yes |
+| Pod-selector `GlobalEgressIP` | not applicable | not run |
+| Gateway failover | yes | not run |
+| Network policy on cross-cluster traffic | not run | not run |
+
+- **Source address:** without Globalnet the server sees the client pod IP. With Globalnet it sees the client
+  cluster's egress global IP.
+- **ClusterIP exports:** the limitation depends on the cluster that hosts the backends, not on the client. A
+  client on a Cilium cluster reaches a ClusterIP export whose backends run on a cluster with kube-proxy. That
+  row was run against Calico. Service discovery still answers with the ClusterIP for an export hosted on
+  Cilium, so such a service has to be exported headless.
+- **Gateway failover:** a label change between two gateway nodes lost about 4 s of pod to pod traffic.
+- **Network policy:** cross-cluster traffic has the `world` identity, so only CIDR rules can match it (see
+  Policy and identity).
+- **What the handler was run with:** pod to remote pod IP, without Globalnet. The other rows were run with
+  the remote CIDRs put in the list by hand. With Globalnet the remote Endpoints advertise the global CIDRs,
+  so those are what the handler adds; that combination has not been run.
 
 ### Datapath
 
@@ -122,6 +178,9 @@ handled the hop.
 | `G_B` | stack: decap, MSS, `cilium_host`, then BPF overlay | stack: table 150, MSS, cable |
 | `W_B` pod | BPF: overlay decap, source identity `world` | BPF: FIB to `vx-submariner`, no SNAT |
 
+The table shows tunnel mode. With native routing, the hops between `G_B` and `W_B` are plain routes instead
+of Cilium's overlay, and the rest is the same.
+
 Every NAT in the design is netfilter on the active gateway. Both directions of a flow pass through that
 gateway's stack, because packets reach it from a device rather than from a local pod. The exception is a
 pod running on the gateway node itself. Its egress is redirected in BPF, which is handled by a
@@ -129,7 +188,13 @@ prerequisite below. With Globalnet, the gateway's SNAT and DNAT sit in the same 
 [appendix](https://gist.github.com/kurtyoon/366ac0e42c60dfbd6b605fa030ffa382) has hop tables for Globalnet
 egress and headless ingress.
 
-### Discovery (submariner-operator)
+### Discovery (submariner-operator, Phase 3)
+
+Discovery is deferred to Phase 3, after the datapath has run in CI. In Phases 1 and 2 a Cilium cluster is
+still discovered as `generic`. The handler is turned on by the ConfigMap field, a cluster with cluster-pool
+IPAM passes its pod CIDR with `--clustercidr` at join, and a Cilium namespace other than `kube-system` goes
+in a second key. Discovery removes those three manual steps. The rules below are the design for it and may
+change with what Phases 1 and 2 show.
 
 A new `pkg/discovery/network/cilium.go` is appended after the KindNet discoverer, so it runs only when
 OpenShift4, OVN-Kubernetes, Weave, Canal, Calico, Flannel and KindNet did not match, and before the generic
@@ -157,35 +222,34 @@ Only after that, when IPAM is `cluster-pool` and the generic sources are empty, 
 still renders `cluster-pool-ipv4-cidr` as `10.0.0.0/8`; reading it before the chaining check would advertise
 that unused range. It also keeps `routing-mode`, `kube-proxy-replacement`, `enable-bpf-masquerade`,
 `enable-host-legacy-routing`, `enable-ip-masq-agent` and `devices` in the operator's `ClusterNetwork`, where
-the namespace env and the follow-up proposal's default come from; diagnose does not read them, it asks the
-agent.
+the follow-up proposal's default comes from; diagnose does not read them, it asks the agent.
 
 Cilium falls back to legacy host routing, with only an info log, when kube-proxy replacement is off or
 masquerading runs in iptables rather than BPF. Diagnose therefore reads the effective mode from the agent
 rather than from the ConfigMap.
 
-`Submariner.Status.NetworkPlugin` becomes `cilium`. The namespace and the settings travel in
-`ClusterNetwork.PluginSettings`, a field the operator declares today but never fills, so no CRD field is
-added; Helm 3 does not upgrade `crds/`. The route-agent DaemonSet builder gains the namespace from the
-discovered network and sets `SUBMARINER_CILIUM_NAMESPACE`, with an explicit envconfig tag, only when the
-plugin is `cilium`: the route-agent DaemonSet rolls with `maxUnavailable: 100%`, so an env var added on
-every cluster would restart every route-agent at once on operator upgrade.
+How the operator hands the result to route-agent is left open until then. The simplest form keeps the
+plugin name `generic` and has the operator write the two keys the handler already reads. Reporting `cilium`
+as the plugin name would be more visible in `subctl show networks`, but it brings back three changes that
+the phased plan removed: `cilium` in the kube-proxy handler's plugin list, a route-agent fallback for plugin
+names it does not know, and an operator check for older route-agent images.
 
 OpenShift with Cilium is out of scope. The OpenShift4 discoverer copies `spec.networkType`, so such a
 cluster reports `Cilium` today, a name the kube-proxy handler does not register for, which leaves it without
-a Submariner datapath. After this change the name is in the plugin list, so that cluster gets the kube-proxy
-handler, while the Cilium handler stays idle because the OpenShift branch sets no namespace. Running the
-Cilium checks on that branch is a follow-up.
+a Submariner datapath. This proposal does not change that.
 
-### route-agent Cilium handler
+### route-agent Cilium handler (Phase 1)
 
-A new handler in `pkg/routeagent_driver/handlers/cilium` is registered for Cilium only. It is additive, like
-the Calico IPPool handler. The existing handlers stay active. The MTU handler and the health checker
-register for any plugin, but the kube-proxy handler, which owns the generic datapath, registers for
-`cni.GetNetworkPlugins()`, and the event registry drops a handler whose plugin set lacks the current plugin,
-so `cilium` goes into that list; a constant alone would cost a Cilium cluster that runs today as `generic`
-its whole datapath at upgrade. A unit test asserts the handler set for `cilium`, and that `calico` and
-`OVNKubernetes` do not get the Cilium handler.
+A new handler in `pkg/routeagent_driver/handlers/cilium` is appended in route-agent's `main.go` only when
+`enable-cilium-support` is `true` in the `submariner-global` ConfigMap, the way submariner#3577 added
+`enable-snat-handler`. That ConfigMap is optional and nothing creates it today, so in Phase 1 the user
+creates or edits it. route-agent already restarts when it changes: on kind, creating it after the deployment
+restarted the route-agent pods within a few seconds, with no manual step. A second, optional key
+`cilium-namespace` names the namespace Cilium runs in and defaults to `kube-system`.
+
+The handler registers for `generic`, which is what a Cilium cluster is discovered as. It is additive, like
+the Calico IPPool handler. No existing handler and no plugin list changes, and with the field unset
+route-agent behaves as it does today.
 
 Its job is to keep every remote cluster CIDR in Cilium's ip-masq-agent list. With ip-masq-agent enabled
 and no ConfigMap, Cilium uses a built-in list that covers all of RFC 1918 and the reserved ranges
@@ -194,40 +258,62 @@ cluster, not only toward remote clusters. On kind it broke pod connections to th
 replies to the pod IP followed Submariner's route and were dropped on the far gateway. An explicit list
 avoids that, so the proposal supports only an explicit list.
 
-The desired set is the subnets of every remote `Endpoint`, kept current from endpoint create, update and
-remove events. If ip-masq-agent is enabled but the `ip-masq-agent` ConfigMap does not exist, the built-in
-list is in effect, so the handler logs it and diagnose fails, naming the Helm value
-`ipMasqAgent.config.nonMasqueradeCIDRs`. The handler does not create the ConfigMap itself, because a
-`create` permission cannot be limited by resource name.
+The desired set is the IPv4 subnets of every remote `Endpoint`, recomputed from all of them each time, so a
+remote gateway failover never drops a CIDR. If the `ip-masq-agent` ConfigMap does not exist or has no list,
+the built-in list is in effect, so the handler logs a warning and writes nothing. It does not create the
+ConfigMap itself, because a `create` permission cannot be limited by resource name.
 
-When the ConfigMap exists, the handler writes `(list − owned) ∪ desired`. `owned` is the set it wrote last
-time, kept in the annotation `submariner.io/non-masquerade-cidrs`, so user entries are never touched. It
-also watches the ConfigMap, so a Helm upgrade that re-renders the list gets repaired without waiting for
-an endpoint event. Cilium reloads the file on change, and propagation is the kubelet ConfigMap sync, about
-a minute.
+When the list exists, the handler appends the desired CIDRs that are missing after the user's entries, and
+writes only when the list changes. It records what it added in the annotation
+`submariner.io/non-masquerade-cidrs`, so user entries are never touched. Entries it added and no longer
+wants are removed on a remote Endpoint update or removal and on a five minute resync, not on every event.
+After a restart the remote Endpoints arrive one at a time, and removing then would briefly drop subnets that
+are still in use. The resync also covers Cilium settings that are turned on after route-agent starts.
+
+A second annotation, `submariner.io/non-masquerade-config-checksum`, holds a checksum of the config the
+handler wrote. When something else replaces the config, for example a chart upgrade that renders the list
+again, the checksum no longer matches and the handler stops treating the entries in the first annotation as
+its own, since whatever is in the new list was put there by its new writer. The handler also watches the
+ConfigMap, so the remote CIDRs come back without waiting for an endpoint event. Cilium reloads the file on
+change, and propagation is the kubelet ConfigMap sync, about a minute.
 
 Only the active gateway writes, with conflict retries. A gateway that steps down removes nothing, since
-removing entries would open a masquerade window. Uninstall removes only the annotated entries and the
-annotation.
+removing entries would open a masquerade window. Uninstall removes only the annotated entries and the two
+annotations.
 
-The handler does no I/O in its constructor. `Init` logs and never returns an error when the namespace, the
-ConfigMap or the permission is missing, because an `Init` error is fatal for route-agent on every node;
-without a namespace the handler stays idle. It writes only when `enable-ip-masq-agent`,
-`enable-bpf-masquerade` and IPv4 or IPv6 masquerading are all on; otherwise it stays idle and diagnose
-names the setting in effect. `Uninstall` runs on every node without gateway state, so it is idempotent and
-retries on conflict. Each endpoint event recomputes the desired set from all remote Endpoints, so a remote
-gateway failover never drops a CIDR.
+The handler does no I/O in its constructor. `Init` starts the ConfigMap watch and does not fail when the
+ConfigMap or the permission is missing, because an `Init` error is fatal for route-agent on every node. It
+writes only when `cilium-config` has `enable-ip-masq-agent`, `enable-bpf-masquerade` and
+`enable-ipv4-masquerade` all on; otherwise it logs the setting and stays idle. `Uninstall` runs on every node
+without gateway state, so it is idempotent and retries on conflict.
 
 The route-agent ClusterRole already has `get` and `list` on all ConfigMaps. The new rule adds `watch` and
 `update` on `configmaps` with `resourceNames: [ip-masq-agent]`; a name-restricted watch is authorized only
 with the field selector `metadata.name=ip-masq-agent`, so the informer uses it. A Role in the Cilium
 namespace would have no creator on the Helm and OLM paths. The handler does not touch ipcache,
-`cilium-config`, `CiliumNode` or any BPF map. `ipv4-native-routing-cidr` is not an alternative to the
-handler, since it is a single static prefix and remote CIDRs change at runtime.
+`cilium-config`, `CiliumNode` or any BPF map, and it uses the Kubernetes client only, with no Cilium client
+library. `ipv4-native-routing-cidr` is not an alternative to the handler, since it is a single static prefix
+and remote CIDRs change at runtime.
 
-### Prerequisites checked by `subctl`
+Known limitations of the handler:
 
-Remote CIDRs must not be masqueraded on any device that carries them. The recommended way is
+- The list is one string field, `data.config`, with two writers. Helm 4 applies charts server-side, and on
+  kind a `helm upgrade` of Cilium with unchanged values failed with a field conflict on that field between
+  the managers `helm` and `submariner-route-agent`. It went through with `--force-conflicts`, after which the
+  handler added the remote CIDRs back in the next ConfigMap version and traffic kept passing. I expect any
+  tool that applies the Cilium chart server-side to hit the same; Helm 3, Argo CD and Flux were not run.
+  Putting the remote CIDRs in the Helm values avoids the conflict, because the handler then has nothing to
+  write. The docs describe both.
+- If `enable-cilium-support` is turned off before uninstall, the entries stay, because the handler is no
+  longer loaded to remove them. The docs say to uninstall first or to remove the entries by hand.
+- If the ClusterRole rule is missing, the handler only logs the error.
+
+### Prerequisites
+
+These are Cilium settings the user makes. Phase 1 documents them and Phase 3 adds the `subctl` checks.
+
+Remote CIDRs must not be masqueraded on any device that carries them. This is the one hard requirement on
+the worker side, and there are two ways to meet it. The recommended way is
 ip-masq-agent with an explicit list (`ipMasqAgent.enabled=true` and `ipMasqAgent.config.nonMasqueradeCIDRs`).
 The list holds the cluster CIDRs known at install time, plus `240.0.0.0/4` while `vx-submariner` is a
 Cilium device, and the handler adds remote CIDRs later. Destinations outside the list are masqueraded as
@@ -239,10 +325,11 @@ and `vx-submariner` is created after the agent starts. Pinning is still worth do
 ip-masq-agent list. Otherwise Cilium takes `vx-submariner`'s address as a NodePort address and applies
 host-firewall policy to it.
 
-The third prerequisite concerns pods on gateway nodes. Their egress is redirected in BPF along table 150
-and skips the gateway's netfilter hooks. With libreswan this also skips the IPsec output policy and the
-packet is dropped. With Globalnet, on any cable, it skips the Globalnet SNAT, and a backend's reply skips
-the DNAT reversal. WireGuard without Globalnet happens to work.
+The other prerequisite is only about pods that run on a gateway node. Traffic that reaches the gateway from
+another node already goes through the host stack with no extra setting. A local pod's egress is redirected
+in BPF along table 150 and skips the gateway's netfilter hooks. With libreswan this also skips the IPsec
+output policy and the packet is dropped. With Globalnet, on any cable, it skips the Globalnet SNAT, and a
+backend's reply skips the DNAT reversal. WireGuard without Globalnet happens to work.
 
 The fix is legacy host routing on gateway nodes only, through a `CiliumNodeConfig` with
 `enable-host-legacy-routing: "true"` and `nodeSelector: submariner.io/gateway=true`. It fixed every
@@ -251,9 +338,9 @@ starts. Every node that can become a gateway must therefore be labelled before C
 labelling a node later needs an agent restart. Keeping workloads off gateway nodes with a taint is an
 untested alternative.
 
-`subctl join` warns when it cannot confirm the masquerade prerequisite. `subctl diagnose` checks the
-masquerade prerequisite, the device set and the gateway-node routing, reading the effective device list and
-host routing mode from the agent through pod exec, as the OVN check does for its database version.
+In Phase 3, `subctl join` warns when it cannot confirm the masquerade prerequisite. `subctl diagnose` checks
+the masquerade prerequisite, the device set and the gateway-node routing, reading the effective device list
+and host routing mode from the agent through pod exec, as the OVN check does for its database version.
 
 One incompatibility is documented rather than worked around. With Cilium's own IPsec encryption enabled,
 Cilium drops raw ESP from sources that are not Cilium nodes, which includes a remote Submariner gateway.
@@ -281,16 +368,16 @@ UDP 4800 between nodes and the cable ports from remote gateways. All of this is 
 Giving remote clusters a Cilium identity is what the ClusterMesh-shaped publisher would add; see
 Follow-ups.
 
-### subctl
+### subctl (Phase 3)
 
-When the plugin is `cilium`, `subctl join` warns if neither the ip-masq-agent list nor a pinned device set
-is configured. `subctl diagnose cni` accepts either, as join does: it checks that ip-masq-agent is enabled
-with a ConfigMap and that every remote CIDR is in the effective list, or that the device set is pinned. It
-also checks pods on gateway nodes with BPF host routing, and Cilium IPsec together with libreswan. `cilium`
-is added to the plugin lists in diagnose (`supportedNetworkPlugins`) and gather (`networkPluginCNIType`);
-without that, diagnose fails with "unsupported CNI plugin" and gather drops the iptables and nftables dumps
-that Cilium clusters get today as `generic`. The Cilium checks use the pod-exec helper in `internal/pods`
-and leave the OVN check untouched.
+When the cluster is discovered as Cilium, `subctl join` warns if neither the ip-masq-agent list nor a pinned
+device set is configured. `subctl diagnose cni` accepts either, as join does: it checks that ip-masq-agent
+is enabled with a ConfigMap and that every remote CIDR is in the effective list, or that the device set is
+pinned. It also checks pods on gateway nodes with BPF host routing, and Cilium IPsec together with
+libreswan. If Phase 3 reports `cilium` as the plugin name, it must also be added to the plugin lists in
+diagnose (`supportedNetworkPlugins`) and gather (`networkPluginCNIType`); without that, diagnose fails with
+"unsupported CNI plugin" and gather drops the iptables and nftables dumps that Cilium clusters get today as
+`generic`. The Cilium checks use the pod-exec helper in `internal/pods` and leave the OVN check untouched.
 
 ### Security model
 
@@ -298,8 +385,9 @@ No Cilium control plane spans clusters, and no Cilium trust relationship is crea
 concern raised on #4106 that a ClusterMesh relationship is bidirectional. Remote clusters stay `world` to
 Cilium policy. The handler's only write is one ConfigMap under a name-scoped role. That grant is bound
 cluster-wide, so it also covers a `kube-system/ip-masq-agent` ConfigMap on clusters that do not run Cilium,
-such as GKE's or the kubernetes-sigs agent's; the handler is not registered there, so nothing writes it,
-but the permission exists. The route-agent ServiceAccount is shared by all nodes, but route-agent already
+such as GKE's or the kubernetes-sigs agent's; the handler is not loaded there unless the field is set, and
+it writes only when `cilium-config` shows the three settings, so nothing writes it, but the permission
+exists. The route-agent ServiceAccount is shared by all nodes, but route-agent already
 runs with host networking and `NET_ADMIN`, which is the same trust level.
 
 ### Cilium versions and maintenance
@@ -307,12 +395,12 @@ runs with host networking and `NET_ADMIN`, which is the same trust level.
 The design depends on four pieces of Cilium configuration: `enable-ip-masq-agent` and its file format,
 `devices`, `enable-host-legacy-routing`, and `CiliumNodeConfig` (`cilium.io/v2`, since 1.16). That makes the
 supported range Cilium 1.16 to 1.20. No BPF map layout, kvstore format or identity number is
-used, so a Cilium upgrade needs no Submariner change unless one of those surfaces changes. The e2e job in
-Step 5 runs a matrix of the two latest Cilium minors.
+used, so a Cilium upgrade needs no Submariner change unless one of those surfaces changes. Only 1.20 has
+been run. The Phase 2 e2e job runs a matrix of the two latest Cilium minors.
 
-There are no new Go dependencies. The handler is one reconcile loop, and the discoverer and diagnose
-checks follow the existing Calico and OVN code. The project would maintain one e2e job with two matrix
-entries and one docs page.
+There are no new Go dependencies and `go.mod` is unchanged. The handler is one reconcile loop, and the
+discoverer and diagnose checks follow the existing Calico and OVN code. The project would maintain one e2e
+job with two matrix entries and one docs page.
 
 ### Alternatives Considered
 
@@ -322,11 +410,24 @@ the gateway itself. It avoids masquerading in tunnel mode, handles gateway-node 
 clusters an identity for policy. But it adds etcd or kine and gRPC to route-agent, an embedded binary in the
 tens of MiB. It needs a CA, a cluster id and name and a reserved peer, it conflicts with existing
 ClusterMesh and KVStoreMesh setups, and it does nothing for native routing, discovery or Services. It is
-kept as a possible Phase 2 for identity.
+kept as a possible later step for identity.
 
 **Direct BPF map programming.** route-agent would write remote entries into Cilium's ipcache map. The map
 is recreated on every agent restart without foreign entries (`pkg/ipcache/cell/cell.go:107-129`), and its
 layout changes between versions. sanek9's labs for #4106 reached the same conclusion.
+
+**A `CiliumNode` object for the gateway, and other Cilium interfaces.** I did not find a Cilium API meant for
+routing a prefix to a node. The ipcache REST endpoint is read-only, CIDR policies give a prefix no tunnel
+endpoint, Egress Gateway SNATs, and the VTEP integration is static agent configuration. The closest thing is
+a `CiliumNode` that is not backed by a node and carries the gateway's address with the remote CIDRs as its
+pod CIDRs. On kind, in tunnel mode, workers then tunnel the traffic to the gateway over Cilium's own VXLAN,
+the pod IP is kept and nothing goes through `vx-submariner`, so neither the ip-masq-agent list nor the
+device setting is needed. It has four limits. Pods on gateway nodes still need legacy host routing. In
+native routing mode the object made no difference. Cilium replaces Submariner's kernel route to the remote
+CIDRs with its own, and deleting the object left the worker with no route. And the Cilium operator
+garbage-collects such an object after a few minutes unless it carries `cilium.io/do-not-gc`, which my runs
+were too short to confirm. The object poses as a node, and the only place I found Cilium doing that is its
+own Egress Gateway scale test, so this proposal stays on configuration that Cilium documents.
 
 **Legacy host routing cluster-wide.** This makes the generic path work at a per-packet cost on every
 node, but it does not stop masquerading on `vx-submariner`. It is kept as the documented fallback, and per
@@ -341,30 +442,29 @@ checks already.
 | | This proposal | ClusterMesh publisher | Direct BPF | Legacy routing |
 |---|---|---|---|---|
 | User setup | ip-masq-agent list or pinned devices; gateway node config | cluster id/name, peer Secret | none | one Helm value |
-| Code to maintain | ConfigMap reconcile, discoverer, diagnose | etcd/kine, TLS, kvstore schema | per-version struct layout | none |
+| Code to maintain | ConfigMap reconcile; later discoverer, diagnose | etcd/kine, TLS, kvstore schema | per-version struct layout | none |
 | Dependencies and footprint | none | etcd or kine, gRPC; tens of MiB | none | stack cost on every node |
 | Cilium coupling | four config keys | kvstore contract, identity ranges | BPF ABI | one config key |
-| Routing modes | designed for both; tested in tunnel mode | tunnel only | both | both |
+| Routing modes | both, tested on kind | tunnel only | both | both |
 | Remote identity in policy | `world` | cluster-scoped | arbitrary | `world` |
 
 ### Backward Compatibility
 
-Other network plugins are unaffected: the discoverer runs after every existing one, and the handler
-registers for `cilium` only. A Cilium cluster that already runs with legacy host routing and `generic`
-discovery keeps working. After an upgrade it is discovered as `cilium`, its advertised subnets do not
-change because the cluster-pool fallback runs only when every generic source is empty, and the handler
-reconciles the ConfigMap if there is one. An operator that sends `cilium` to an older route-agent image
-would lose the kube-proxy handler there, so the operator sends `generic` when `Spec.Version` is older than
-the release that carries this change. An image set through `ImageOverrides` cannot be dated, so the
-documentation says to override the operator together with route-agent. Route-agent is also changed to treat
-a plugin name it does not know as `generic`; today only an empty name gets that default.
+Phase 1 changes nothing unless `enable-cilium-support` is set: the handler is not loaded, the plugin name
+stays `generic`, and every existing handler runs as before. With the field set on a cluster that does not
+run Cilium, the handler finds no `cilium-config` and stays idle. A Cilium cluster that already runs with
+legacy host routing and `generic` discovery keeps working with or without the field.
+
+Phase 3 is where compatibility needs care, and only if it changes the plugin name. An operator that sends
+`cilium` to an older route-agent image would lose the kube-proxy handler there, which is why the Discovery
+section prefers keeping `generic`.
 
 ## Implementation Plan
 
-### Step 1: Reproduce and decide (done)
+### Lab results
 
-The kind lab used Cilium 1.20.2 and Submariner 0.24.2 with libreswan and WireGuard, plus a second pair of
-clusters with overlapping CIDRs for Globalnet. Unmodified, pod traffic left with the 240.x address. A
+The first kind lab used Cilium 1.20.2 and Submariner 0.24.2 with libreswan and WireGuard, plus a second pair
+of clusters with overlapping CIDRs for Globalnet. Unmodified, pod traffic left with the 240.x address. A
 pinned device set fixed it, and so did ip-masq-agent. The built-in list broke pod-to-broker traffic, which
 a later run with an explicit list did not. Legacy routing on gateway nodes fixed pods there. Against a
 Calico cluster, pod traffic and headless exports passed both ways, and ClusterIP exports passed into the
@@ -376,65 +476,81 @@ traffic, on the pair without Globalnet. A later run on Submariner 0.25.0 and Cil
 prerequisites gave the same results: the explicit list was in effect in BPF, headless exports,
 `GlobalEgressIP` and the reverse direction passed on both cables, and ClusterIP exports still failed. The
 [appendix](https://gist.github.com/kurtyoon/366ac0e42c60dfbd6b605fa030ffa382) has the matrix and the source
-references. Still to run are the full `verify --only connectivity` suite, network policy, the VXLAN cable,
-native routing and cluster-pool IPAM.
+references.
 
-### Step 2: Discovery
+The Phase 1 handler was then run on kind with Cilium 1.20.2 and libreswan, without Globalnet, in the
+combinations of the Supported configurations table. Besides the eight paths, three cases were run in tunnel
+mode: creating `submariner-global` after the deployment, a chart upgrade of Cilium with unchanged values,
+and an uninstall of the other cluster while the local route-agent was held down, after which the resync
+removed the stale CIDRs about five minutes after route-agent came back. `subctl uninstall` removed the
+handler's entries and annotations and left the user's entries. Still to run are the full
+`verify --only connectivity` suite, network policy and the VXLAN cable.
 
-**Files:** `submariner-operator/pkg/discovery/network/cilium.go`, `network.go`,
-`internal/controllers/submariner/route_agent_resources.go`; `submariner/pkg/cni/plugins.go`.
-
-Detection in the order above, the cluster-pool fallback, the `cilium` entry in the plugin list, the
-`PluginSettings` carry and the namespace env. Unit tests use fake DaemonSets and ConfigMaps for
-cluster-pool, kubernetes and multi-pool IPAM, for chaining, and for the managed-distribution markers.
-
-### Step 3: Cilium handler
+### Phase 1: Cilium handler
 
 **Files:** `submariner/pkg/routeagent_driver/handlers/cilium/`, `pkg/routeagent_driver/main.go`;
 `submariner-operator/config/rbac/submariner-route-agent/`; the Helm charts.
 
-The reconcile with annotation ownership and a ConfigMap watch. Unit tests cover a missing ConfigMap, one
-without entries, one with user entries, annotation drift, conflict retry and uninstall. The charts need no
-template change; their RBAC is regenerated from the operator at chart release.
+The reconcile with annotation ownership, the checksum, the resync and a ConfigMap watch, loaded behind
+`enable-cilium-support`. Unit tests cover a missing ConfigMap, one without a list, one with user entries,
+annotation drift, a replaced config, conflict retry and uninstall. The charts need no template change; their
+RBAC is regenerated from the operator at chart release. A first implementation is on two branches:
+[submariner](https://github.com/kurtyoon/submariner/tree/4247-cilium-ipmasq-handler) and
+[submariner-operator](https://github.com/kurtyoon/submariner-operator/tree/cilium-ip-masq-agent-rbac).
 
-### Step 4: subctl
-
-**Files:** `subctl/pkg/diagnose/cilium.go`, `cni.go`; `cmd/subctl/join.go`.
-
-The join warning and the diagnose checks, using the pod-exec helper in `internal/pods`; the OVN check keeps
-its own exec code.
-
-### Step 5: CI and docs
+### Phase 2: Shipyard and CI
 
 **Files:** shipyard (a kind Cilium deploy option), `submariner/test/e2e/dataplane`, submariner-website
 (`operations/deployment/cilium.md`).
 
-One e2e job on `submariner` runs Cilium ↔ Cilium, in tunnel mode by default, through a `cni: cilium` branch
-in shipyard that leaves the defaults and the OVN path unchanged. Cilium ↔ Calico follows once shipyard can
+Shipyard deploys kind clusters with Cilium through a `cni: cilium` branch that leaves the defaults and the
+OVN path unchanged, and sets `enable-cilium-support` in `submariner-global`. One e2e job on `submariner`
+runs Cilium ↔ Cilium, in tunnel mode by default, on every commit. Cilium ↔ Calico follows once shipyard can
 mix CNIs in one job. In the dataplane suite, the existing headless Globalnet spec gets the `basic` label,
 which adds its two specs to `basic-connectivity` on every Globalnet pair. The pod-to-service and
-ClusterIP-export specs read the target cluster's `status.networkPlugin` and are skipped only when it is
-exactly `cilium`; when the value cannot be read they run. Five of the six Globalnet groups use
+ClusterIP-export specs are skipped toward a Cilium cluster. Until Phase 3 the job tells the suite which
+clusters run Cilium; after it, the specs read the discovered plugin. Five of the six Globalnet groups use
 GlobalServiceIP, so toward a Cilium target the skip also removes their egress-selector and host-network
 cases. On a Globalnet pair the ClusterIP-export case comes back with the follow-up proposal's specs; without
-Globalnet it stays skipped, as does the raw pod-to-service spec. The docs cover the prerequisites, the
-policy notes, and the ClusterIP limitation with its workaround.
+Globalnet it stays skipped, as does the raw pod-to-service spec. The docs cover the field, the
+prerequisites, the handler's limitations, the policy notes, and the ClusterIP limitation with its
+workaround.
+
+### Phase 3: Discovery and subctl
+
+**Files:** `submariner-operator/pkg/discovery/network/cilium.go`, `network.go`;
+`subctl/pkg/diagnose/cilium.go`, `cni.go`; `cmd/subctl/join.go`.
+
+Detection in the order given under Discovery and the cluster-pool fallback, so that the field, the
+`--clustercidr` flag and the namespace key are no longer needed. Unit tests use fake DaemonSets and
+ConfigMaps for cluster-pool, kubernetes and multi-pool IPAM, for chaining, and for the managed-distribution
+markers. The join warning and the diagnose checks use the pod-exec helper in `internal/pods`; the OVN check
+keeps its own exec code.
 
 ## Done When
 
+Phase 1:
+
 ```bash
-subctl show networks | grep cilium
-subctl diagnose cni
+kubectl -n submariner-operator get configmap submariner-global -o jsonpath='{.data.enable-cilium-support}'
 kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg bpf ipmasq list
-subctl verify --context cluster1 --tocontext cluster2 --only connectivity,service-discovery
+subctl verify --context cluster1 --tocontext cluster2 --only connectivity
 ```
 
-- [ ] The pod-to-pod specs of `verify --only connectivity` pass Cilium ↔ Cilium in CI and Cilium ↔ Calico
-  in a manual run, in tunnel mode with libreswan and WireGuard. Legacy routing is used on gateway nodes only.
+- [ ] With the field set, the remote CIDRs appear in the ip-masq-agent list and in BPF, and the pod-to-pod
+  specs of `verify --only connectivity` pass Cilium ↔ Cilium on kind, in tunnel mode and with native routing.
+  Legacy routing is used on gateway nodes only.
+- [ ] With the field unset, route-agent's handler set is the same as today.
+
+Phase 2:
+
+- [ ] A Cilium CI job runs on `submariner`, and the deployment docs are published.
 - [ ] On a Globalnet pair, the headless spec passes, and the ClusterIP-export specs are skipped toward
   Cilium.
-- [ ] `subctl diagnose cni` reports each prerequisite.
-- [ ] A Cilium CI job runs on `submariner`, and the deployment docs are published.
+
+Phase 3:
+
+- [ ] A Cilium cluster joins without the field, and `subctl diagnose cni` reports each prerequisite.
 
 ## Follow-ups
 
@@ -444,5 +560,5 @@ headless exports are handled today, and turns on by itself on Cilium clusters wi
 Clusters without Globalnet would need a small ingress range advertised to peers. In my kind runs a
 release-0.25 peer did not pick up a subnet added to an existing Endpoint, and rejected an Endpoint that
 arrived before its Cluster without re-checking it; I will file both as issues, and that part waits for those
-fixes. A later Phase 2 could give remote clusters a cluster-scoped Cilium identity, so that policy can select
+fixes. A later step could give remote clusters a cluster-scoped Cilium identity, so that policy can select
 them and Egress Gateway skips them; #4106 is the working reference for that.
